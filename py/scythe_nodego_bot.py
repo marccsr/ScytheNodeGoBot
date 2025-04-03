@@ -3,40 +3,43 @@ import asyncio
 import time
 import os
 import logging
+import json
 import csv
-from aiohttp import ClientSession, TCPConnector
-import socket
 
-# ---------------- Configuration Constants ----------------
-TASKS_FILE = 'tasks.csv'       # CSV file with task credentials (username, bearer_token)
-POLL_INTERVAL = 120            # Polling interval in seconds
+TASKS_FILE = 'tasks.csv'
+PROXIES_FILE = 'proxies.txt'
+POLL_INTERVAL = 120
+LOGIN_URL = 'https://nodego.ai/api/auth/login'
+PING_URL = 'https://nodego.ai/api/user/nodes/ping'
 
-# ---------------- Logging Setup ----------------
+WEBSITE_KEY = '0x4AAAAAAA4zgfgCoYChIZf4'
+CAPTCHA_API_KEY = 'ff5b51608b309ac7cb673197d74033b0'
+CREATE_TASK_URL = 'https://api.2captcha.com/createTask'
+GET_TASK_RESULT_URL = 'https://api.2captcha.com/getTaskResult'
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ---------------- API Endpoints ----------------
-api_url = 'https://nodego.ai/api/user/me'  # NodeGo API endpoint
-
-# ---------------- Load Tasks from CSV ----------------
+# ---------------- Read and Save Tasks ----------------
 def read_tasks(filename=TASKS_FILE):
     tasks = []
     try:
         with open(filename, newline='') as csvfile:
             reader = csv.reader(csvfile)
-            header = next(reader)  # Skip the first row if it's a header
+            header = next(reader)
             
             for row in reader:
-                if len(row) < 3:  # Ensure the row has all required columns
+                if len(row) < 4:
                     continue
                 
-                username, bearer_token, proxy = row  # Proxy column is optional
-                if not username.strip() or not bearer_token.strip():
+                username, password, proxy, bearer_token = row
+                if not username.strip() or not password.strip():
                     continue
                 
                 tasks.append({
                     "username": username.strip(),
-                    "bearer_token": bearer_token.strip(),
-                    "proxy": proxy.strip() if len(row) > 2 else None  # Optional proxy field
+                    "password": password.strip(),
+                    "proxy": proxy.strip() if proxy else None,
+                    "bearer_token": bearer_token.strip() if bearer_token else None
                 })
     except FileNotFoundError:
         logging.error(f"Tasks file '{filename}' not found.")
@@ -44,71 +47,219 @@ def read_tasks(filename=TASKS_FILE):
         logging.error(f"Error reading tasks from CSV: {e}")
     return tasks
 
-# ---------------- Send Ping to NodeGo ----------------
+def save_tasks(tasks, filename=TASKS_FILE):
+    try:
+        with open(filename, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['username', 'password', 'proxy', 'bearer_token'])
+            for task in tasks:
+                writer.writerow([task['username'], task['password'], task.get('proxy', ''), task.get('bearer_token', '')])
+        logging.info(f"Tasks successfully saved to {filename}")
+    except Exception as e:
+        logging.error(f"Error saving tasks to CSV: {e}")
+
+# ---------------- Load Proxies ----------------
+def read_proxies(filename=PROXIES_FILE):
+    proxies = []
+    try:
+        with open(filename, 'r') as f:
+            proxies = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        logging.error(f"Proxies file '{filename}' not found.")
+    except Exception as e:
+        logging.error(f"Error reading proxies from file: {e}")
+    return proxies
+
+def create_proxy_dict(proxy):
+    if proxy:
+        proxy_parts = proxy.split('@')
+        if len(proxy_parts) == 2:
+            user_pass, url = proxy_parts
+            username, password = user_pass.split(':')
+            return {
+                'http': f'http://{username}:{password}@{url}',
+                'https': f'http://{username}:{password}@{url}'
+            }
+    return None
+
+# ---------------- Solve Captcha ----------------
+async def solve_turnstile_captcha():
+    create_task_payload = {
+        "clientKey": CAPTCHA_API_KEY,
+        "task": {
+            "type": "TurnstileTaskProxyless",
+            "websiteURL": "https://app.nodego.ai/",
+            "websiteKey": WEBSITE_KEY
+        }
+    }
+    
+    try:
+        logging.info("Creating captcha task in 2captcha...")
+        async with aiohttp.ClientSession() as session:
+            create_response = await session.post(CREATE_TASK_URL, json=create_task_payload)
+            create_data = await create_response.json()
+        
+        if create_data.get('errorId') != 0:
+            logging.error(f"Error creating captcha task: {create_data.get('errorCode')} - {create_data.get('errorDescription')}")
+            return None
+        
+        task_id = create_data.get('taskId')
+        if not task_id:
+            logging.error("Could not get taskId from 2captcha")
+            return None
+        
+        logging.info(f"Captcha task created successfully: taskId={task_id}")
+        
+        get_result_payload = {
+            "clientKey": CAPTCHA_API_KEY,
+            "taskId": task_id
+        }
+        
+        max_attempts = 24
+        for attempt in range(1, max_attempts + 1):
+            logging.info(f"Attempt {attempt}/{max_attempts} to get captcha result...")
+            
+            await asyncio.sleep(5)
+            
+            result_response = await aiohttp.ClientSession().post(GET_TASK_RESULT_URL, json=get_result_payload)
+            result_data = await result_response.json()
+            
+            if result_data.get('status') == 'ready':
+                token = result_data.get('solution', {}).get('token')
+                if token:
+                    logging.info(f"Captcha solved successfully: {token[:30]}...")
+                    return token
+            
+            if result_data.get('errorId') != 0:
+                logging.error(f"Error solving captcha: {result_data.get('errorCode')} - {result_data.get('errorDescription')}")
+                break
+            
+            logging.info("Captcha still processing, waiting...")
+        
+        logging.error("Timeout waiting to solve captcha")
+        return None
+    except Exception as e:
+        logging.error(f"Error solving captcha: {e}")
+        return None
+
+# ---------------- Login ----------------
+async def login(username, password, captcha_token=None):
+    try:
+        headers = {
+            'Host': 'nodego.ai',
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
+        }
+        
+        if captcha_token:
+            payload = {
+                "captcha": captcha_token,
+                "email": username,
+                "password": password
+            }
+            logging.info(f"Login for user: {username} with captcha: {captcha_token[:30]}...")
+        else:
+            payload = {
+                "email": username,
+                "password": password
+            }
+            logging.info(f"Attempting direct login for {username}...")
+        
+        async with aiohttp.ClientSession() as session:
+            response = await session.post(LOGIN_URL, headers=headers, json=payload)
+        
+        if response.status == 201:
+            data = await response.json()
+            access_token = data.get('metadata', {}).get('accessToken')
+            if access_token:
+                logging.info(f"Successful login for {username}")
+                return access_token
+            else:
+                logging.error(f"Token not found in response for {username}")
+        else:
+            logging.error(f"Login failed for {username}: {response.status}")
+        
+        return None
+    except Exception as e:
+        logging.error(f"Error in login request: {e}")
+        return None
+
+# ---------------- Ping ----------------
 async def send_ping(session, token, proxy=None):
     headers = {
         'Authorization': f'Bearer {token}',
         'Accept': 'application/json, text/plain, */*',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
-        'Referer': 'https://nodego.ai/',
-        'Origin': 'https://nodego.ai/'
+        'Content-Type': 'application/json',
     }
 
-    # Handle proxies with authentication
-    connector = None
-    if proxy:
-        connector = await create_proxy_connector(proxy)
+    proxies = create_proxy_dict(proxy)
     
     try:
-        async with session.get(api_url, headers=headers, connector=connector) as response:
+        async with session.post(PING_URL, headers=headers, json={"type": "extension", "extensionInstalled": True}, proxy=proxies) as response:
             if response.status == 200:
-                logging.info(f"[✔] Ping exitoso para {token[:6]}...")
-            else:
-                logging.error(f"[✖] Error en ping para {token[:6]}: {response.status}")
-    except Exception as e:
-        logging.error(f"[✖] Fallo en la solicitud de ping: {e}")
-
-# ---------------- Create Proxy Connector ----------------
-async def create_proxy_connector(proxy):
-    """Create aiohttp connector using proxy with authentication"""
-    try:
-        # Parse proxy URL (http://username:password@ip:port)
-        proxy_url = proxy.strip().lower()
-        if not proxy_url.startswith("http"):
-            proxy_url = "http://" + proxy_url
-
-        # Parse the proxy URL to extract username, password, and URL
-        parsed_url = aiohttp.helpers.urllib.parse.urlparse(proxy_url)
-        proxy_host = parsed_url.hostname
-        proxy_port = parsed_url.port
-        proxy_user = parsed_url.username
-        proxy_password = parsed_url.password
-
-        # Setup proxy with authentication
-        proxy_connector = TCPConnector(ssl=False)
-        return aiohttp.ClientSession(connector=proxy_connector, proxy=proxy_url, auth=aiohttp.BasicAuth(proxy_user, proxy_password))
-    
-    except Exception as e:
-        logging.error(f"[✖] Error al crear el conector de proxy: {e}")
-        return None
+                logging.info(f"Successful ping for {token[:6]}... Status: {response.status}")
+                return True
+            return False
+    except aiohttp.ClientError as e:
+        logging.error(f"Error in ping request: {e}")
+        return False
 
 # ---------------- Main Bot Function ----------------
 async def start_bot():
     tasks_list = read_tasks()
+    proxies_list = read_proxies()  # Read proxies from proxies.txt
 
     if not tasks_list:
         logging.error("No tasks to process. Exiting.")
         return
-
+    
+    logging.info("Starting ScytheBot for NodeGo...\n")
+    
+    tasks_updated = False
+    for i, task in enumerate(tasks_list):
+        username = task["username"]
+        password = task["password"]
+        bearer_token = task.get("bearer_token", "")
+        
+        if bearer_token:
+            logging.info(f"Using existing valid bearer token for {username}")
+            continue
+        
+        logging.info(f"Attempting direct login for {username}")
+        fresh_token = await login(username, password)
+        
+        if not fresh_token:
+            logging.info(f"Direct login failed, trying with captcha for {username}")
+            captcha_token = await solve_turnstile_captcha()
+            if captcha_token:
+                fresh_token = await login(username, password, captcha_token)
+        
+        if fresh_token:
+            tasks_list[i]["bearer_token"] = fresh_token
+            tasks_updated = True
+            
+            # Assign proxy from proxies_list if it's available
+            if len(proxies_list) > i:
+                tasks_list[i]["proxy"] = proxies_list[i]
+            
+    if tasks_updated:
+        save_tasks(tasks_list)
+    
     async with aiohttp.ClientSession() as session:
-        logging.info("[🔥] Iniciando ScytheBot para NodeGo...\n")
         while True:
-            logging.info(f"\n⏰ Ping Cycle at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logging.info(f"\nPing cycle at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
             for task in tasks_list:
-                proxy = task.get("proxy")
-                await send_ping(session, task["bearer_token"], proxy)
-                await asyncio.sleep(POLL_INTERVAL)  # Espera el intervalo entre pings
+                bearer_token = task.get("bearer_token", "")
+                
+                if bearer_token:
+                    await send_ping(session, bearer_token, task.get("proxy", None))
+                
+                await asyncio.sleep(5)
+            
+            logging.info(f"Waiting {POLL_INTERVAL} seconds for next cycle...")
+            await asyncio.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(start_bot())
+    asyncio.run(start_bot())
