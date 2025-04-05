@@ -94,26 +94,28 @@ class MultiAccountPinger {
 
     loadAccounts() {
         try {
-            const accountData = fs.readFileSync('data.txt', 'utf8')
+            const tasksData = fs.readFileSync('tasks.csv', 'utf8')
                 .split('\n')
-                .filter(line => line.trim());
-            const proxyData = fs.existsSync('proxies.txt')
-                ? fs.readFileSync('proxies.txt', 'utf8')
-                    .split('\n')
-                    .filter(line => line.trim())
-                : [];
-            return accountData.map((token, index) => ({
-                token: token.trim(),
-                proxy: proxyData[index] || null
-            }));
+                .filter(line => line.trim())
+                .map(line => {
+                    const [username, password, proxy, bearer_token] = line.split(',');
+                    return {
+                        username: username.trim(),
+                        password: password.trim(),
+                        proxy: proxy.trim() || null,
+                        bearer_token: bearer_token.trim() || null
+                    };
+                });
+            
+            return tasksData;
         } catch (error) {
-            console.error(chalk.red('Error reading accounts:'), error);
+            console.error(chalk.red('Error reading tasks:'), error);
             process.exit(1);
         }
     }
 
     async processPing(account) {
-        const pinger = new ScytheNodeGo(account.token, account.proxy);
+        const pinger = new ScytheNodeGo(account.bearer_token, account.proxy);
         try {
             const pingResponse = await pinger.ping();
             console.log(chalk.green(`Ping Status:`));

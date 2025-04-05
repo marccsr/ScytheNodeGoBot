@@ -7,7 +7,6 @@ import json
 import csv
 
 TASKS_FILE = 'tasks.csv'
-PROXIES_FILE = 'proxies.txt'
 POLL_INTERVAL = 120
 LOGIN_URL = 'https://nodego.ai/api/auth/login'
 PING_URL = 'https://nodego.ai/api/user/nodes/ping'
@@ -57,18 +56,6 @@ def save_tasks(tasks, filename=TASKS_FILE):
         logging.info(f"Tasks successfully saved to {filename}")
     except Exception as e:
         logging.error(f"Error saving tasks to CSV: {e}")
-
-# ---------------- Load Proxies ----------------
-def read_proxies(filename=PROXIES_FILE):
-    proxies = []
-    try:
-        with open(filename, 'r') as f:
-            proxies = [line.strip() for line in f if line.strip()]
-    except FileNotFoundError:
-        logging.error(f"Proxies file '{filename}' not found.")
-    except Exception as e:
-        logging.error(f"Error reading proxies from file: {e}")
-    return proxies
 
 def create_proxy_dict(proxy):
     if proxy:
@@ -208,7 +195,6 @@ async def send_ping(session, token, proxy=None):
 # ---------------- Main Bot Function ----------------
 async def start_bot():
     tasks_list = read_tasks()
-    proxies_list = read_proxies()  # Read proxies from proxies.txt
 
     if not tasks_list:
         logging.error("No tasks to process. Exiting.")
@@ -239,10 +225,6 @@ async def start_bot():
             tasks_list[i]["bearer_token"] = fresh_token
             tasks_updated = True
             
-            # Assign proxy from proxies_list if it's available
-            if len(proxies_list) > i:
-                tasks_list[i]["proxy"] = proxies_list[i]
-            
     if tasks_updated:
         save_tasks(tasks_list)
     
@@ -251,15 +233,12 @@ async def start_bot():
             logging.info(f"\nPing cycle at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             
             for task in tasks_list:
-                bearer_token = task.get("bearer_token", "")
-                
-                if bearer_token:
-                    await send_ping(session, bearer_token, task.get("proxy", None))
-                
+                bearer_token = await send_ping(session, bearer_token, task.get("proxy", None))
                 await asyncio.sleep(5)
-            
+                
             logging.info(f"Waiting {POLL_INTERVAL} seconds for next cycle...")
             await asyncio.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     asyncio.run(start_bot())
+
